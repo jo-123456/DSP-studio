@@ -15,6 +15,8 @@ from signals.generator import GENERATORS, generate
 from signals.analysis import compute_fft, dominant_frequency
 from signals.filters import apply_filter, frequency_response
 from signals.voice import load_wav, wav_bytes, telephone_effect, reduce_noise, snr_db
+from signals.spectrogram import compute_spectrogram
+from scipy.signal import chirp
 
 st.set_page_config(page_title="DSP Studio", layout="wide")
 
@@ -33,9 +35,24 @@ def line_fig(series, xtitle, ytitle, height=340):
     return fig
 
 
+def spec_fig(f, t, s_db, fmax=None, height=360):
+    """Spectrogram heatmap. Strides the data so huge clips stay responsive."""
+    if fmax:
+        keep = f <= fmax
+        f, s_db = f[keep], s_db[keep]
+    ft = max(1, len(t) // 600)
+    ff = max(1, len(f) // 400)
+    fig = go.Figure(go.Heatmap(x=t[::ft], y=f[::ff], z=s_db[::ff, ::ft],
+                               colorscale="Viridis",
+                               colorbar=dict(title="dB")))
+    fig.update_layout(xaxis_title="Time (s)", yaxis_title="Frequency (Hz)",
+                      height=height, margin=dict(l=40, r=20, t=20, b=40))
+    return fig
+
+
 # ---------- Sidebar: signal source ----------
 st.sidebar.title("DSP Studio")
-st.sidebar.caption("Parts 1 & 2 · Analysis, Filtering & Voice")
+st.sidebar.caption("Analysis · Filtering · Spectrogram · Voice")
 
 source = st.sidebar.radio("Signal source", ["Generate", "Upload"])
 
@@ -65,8 +82,8 @@ else:
 
 # ---------- Main area ----------
 st.title("DSP Studio")
-tab_analysis, tab_filter, tab_voice = st.tabs(
-    ["Signal & Spectrum", "Filtering", "Voice Demo"]
+tab_analysis, tab_filter, tab_spec, tab_voice = st.tabs(
+    ["Signal & Spectrum", "Filtering", "Spectrogram", "Voice Demo"]
 )
 
 NO_SIGNAL_MSG = ("Upload a WAV file from the sidebar, or switch to 'Generate' "
@@ -153,7 +170,39 @@ with tab_filter:
             m2_.metric("Dominant frequency (filtered)",
                        f"{dominant_frequency(y_f, sample_rate):.1f} Hz")
 
-# ===== Tab 3: voice demo =====
+# ===== Tab 3: spectrogram =====
+with tab_spec:
+    st.subheader("Spectrogram (frequency vs time)")
+    st.caption("A longer window shows frequencies more precisely but blurs timing; "
+               "a shorter window does the opposite.")
+    spec_source = st.radio("Signal", ["Current signal", "Linear chirp demo (200 Hz to near Nyquist)"],
+                           horizontal=True)
+    if spec_source == "Current signal":
+        x_s, fs_s = y, sample_rate
+    else:
+        fs_s = sample_rate
+        t_c = np.arange(int(2 * fs_s)) / fs_s
+        x_s = chirp(t_c, f0=200, f1=0.9 * fs_s / 2, t1=2, method="linear")
+
+    if x_s is None:
+        st.info(NO_SIGNAL_MSG)
+    else:
+        c1, c2, c3 = st.columns(3)
+        win_len = c1.select_slider("Window length (samples)", [128, 256, 512, 1024], value=256)
+        overlap = c2.slider("Overlap (%)", 0, 90, 75) / 100
+        win_type = c3.selectbox("Window", ["hann", "hamming", "blackman"], key="spec_win")
+        try:
+            f_sp, t_sp, s_db = compute_spectrogram(x_s, fs_s, nperseg=win_len,
+                                                   overlap=overlap, window=win_type)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            fmax = st.slider("Max frequency shown (Hz)", 100, int(fs_s / 2), int(fs_s / 2))
+            st.plotly_chart(spec_fig(f_sp, t_sp, s_db, fmax=fmax), width="stretch")
+            st.caption(f"Frequency resolution: about {fs_s / min(win_len, len(x_s)):.1f} Hz per bin; "
+                       f"time step: {1000 * (min(win_len, len(x_s)) * (1 - overlap)) / fs_s:.1f} ms.")
+
+# ===== Tab 4: voice demo =====
 with tab_voice:
     st.subheader("Voice filtering demo")
     voice_file = st.file_uploader("Voice clip (WAV)", type=["wav"], key="voice_clip")
@@ -202,3 +251,18 @@ with tab_voice:
         st.plotly_chart(line_fig([("before", fa, ma, BLUE), ("after", fb, mb, ORANGE)],
                                  "Frequency (Hz)", "Magnitude"),
                         width="stretch")
+
+        st.subheader("Spectrogram: before vs after")
+        try:
+            f_a, t_a, s_a = compute_spectrogram(x_in, fs, nperseg=512)
+            f_b, t_b, s_b = compute_spectrogram(y_v, fs, nperseg=512)
+            ref = max(s_a.max(), s_b.max())  # same colour scale on both
+            s_a = np.maximum(s_a, ref - 80)
+            s_b = np.maximum(s_b, ref - 80)
+            g1, g2 = st.columns(2)
+            g1.markdown("**Before**")
+            g1.plotly_chart(spec_fig(f_a, t_a, s_a), width="stretch")
+            g2.markdown("**After**")
+            g2.plotly_chart(spec_fig(f_b, t_b, s_b), width="stretch")
+        except ValueError as e:
+            st.warning(f"Spectrogram unavailable: {e}")
