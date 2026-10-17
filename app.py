@@ -1,5 +1,6 @@
 """
-DSP Studio — Parts 1 & 2: Signal Input, Frequency Analysis, Filtering, Voice
+DSP Studio — signal analysis, filtering, spectrogram, operations and voice demo
+(dark "lab instrument" theme: see ui_theme.py and .streamlit/config.toml)
 
 Run with:
     streamlit run app.py
@@ -16,23 +17,39 @@ from signals.analysis import compute_fft, dominant_frequency
 from signals.filters import apply_filter, frequency_response
 from signals.voice import load_wav, wav_bytes, telephone_effect, reduce_noise, snr_db
 from signals.spectrogram import compute_spectrogram
+from ui_theme import (apply_theme, header, style_fig, show_chart, rgba,
+                      PRIMARY, SECONDARY, WARN, SPECTROGRAM_SCALE)
+from signals.operations import (
+    moving_average_kernel, echo_kernel, convolve_signals, cross_correlation,
+    estimate_delay, estimate_period, am_modulate, am_demodulate, fm_modulate,
+    fm_demodulate, recovery_error)
+from signals.windowing import WINDOWS, windowed_spectrum, to_db
+from signals.loaders import numeric_columns
 from scipy.signal import chirp
 
 st.set_page_config(page_title="DSP Studio", layout="wide")
+apply_theme()
 
-BLUE, NAVY, ORANGE = "#2E74B5", "#1F3864", "#E8833A"
+BLUE, NAVY, ORANGE = PRIMARY, SECONDARY, WARN
 
 
 def line_fig(series, xtitle, ytitle, height=340):
     """series: list of (name, x, y, color). One Plotly line chart."""
     fig = go.Figure()
     for name, x, y_, color in series:
-        fig.add_trace(go.Scatter(x=x, y=y_, mode="lines", name=name,
-                                 line=dict(color=color)))
+        fig.add_trace(go.Scatter(
+            x=x, y=y_, mode="lines", name=name, line=dict(color=color, width=1.5),
+            fill="tozeroy" if len(series) == 1 else None,
+            fillcolor=rgba(color, 0.10) if len(series) == 1 else None))
     fig.update_layout(xaxis_title=xtitle, yaxis_title=ytitle, height=height,
-                      margin=dict(l=40, r=20, t=20, b=40),
-                      legend=dict(orientation="h", y=1.12))
-    return fig
+                      margin=dict(l=40, r=20, t=20, b=40))
+    return style_fig(fig)
+
+
+def thin(*arrays, max_points=20000):
+    """Stride long arrays so Plotly stays responsive."""
+    k = max(1, len(arrays[0]) // max_points)
+    return [a[::k] for a in arrays]
 
 
 def spec_fig(f, t, s_db, fmax=None, height=360):
@@ -43,16 +60,16 @@ def spec_fig(f, t, s_db, fmax=None, height=360):
     ft = max(1, len(t) // 600)
     ff = max(1, len(f) // 400)
     fig = go.Figure(go.Heatmap(x=t[::ft], y=f[::ff], z=s_db[::ff, ::ft],
-                               colorscale="Viridis",
+                               colorscale=SPECTROGRAM_SCALE,
                                colorbar=dict(title="dB")))
     fig.update_layout(xaxis_title="Time (s)", yaxis_title="Frequency (Hz)",
                       height=height, margin=dict(l=40, r=20, t=20, b=40))
-    return fig
+    return style_fig(fig)
 
 
 # ---------- Sidebar: signal source ----------
 st.sidebar.title("DSP Studio")
-st.sidebar.caption("Analysis · Filtering · Spectrogram · Voice")
+st.sidebar.caption("Analysis · Filtering · Spectrogram · Operations · Voice")
 
 source = st.sidebar.radio("Signal source", ["Generate", "Upload"])
 
@@ -68,11 +85,25 @@ if source == "Generate":
     st.sidebar.caption(f"Sample rate: {sample_rate} Hz")
 
 else:
-    uploaded = st.sidebar.file_uploader("Upload a WAV file", type=["wav"])
-    if uploaded is not None:
+    uploaded = st.sidebar.file_uploader("Upload a WAV or CSV file", type=["wav", "csv"])
+    if uploaded is not None and uploaded.name.lower().endswith(".csv"):
+        try:
+            table = numeric_columns(io.BytesIO(uploaded.getvalue()))
+        except ValueError as e:
+            st.sidebar.error(str(e))
+        else:
+            col = st.sidebar.selectbox("Column", list(table.columns))
+            sample_rate = float(st.sidebar.number_input("Sample rate (Hz)", 1.0, 100000.0, 1000.0))
+            remove_dc = st.sidebar.checkbox("Remove DC offset", value=True)
+            y = table[col].to_numpy(dtype=float)
+            if remove_dc:
+                y = y - y.mean()
+            y = y / (np.max(np.abs(y)) if np.max(np.abs(y)) > 0 else 1.0)
+            t = np.arange(len(y)) / sample_rate
+    elif uploaded is not None:
         import scipy.io.wavfile as wavfile
 
-        sr, data = wavfile.read(io.BytesIO(uploaded.read()))
+        sr, data = wavfile.read(io.BytesIO(uploaded.getvalue()))
         if data.ndim > 1:
             data = data.mean(axis=1)  # collapse stereo to mono
         y = data.astype(np.float64)
@@ -81,9 +112,15 @@ else:
         t = np.linspace(0, len(y) / sr, len(y), endpoint=False)
 
 # ---------- Main area ----------
-st.title("DSP Studio")
-tab_analysis, tab_filter, tab_spec, tab_voice = st.tabs(
-    ["Signal & Spectrum", "Filtering", "Spectrogram", "Voice Demo"]
+header()
+if y is not None:
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Sampling frequency", f"{sample_rate:,.0f} Hz")
+    k2.metric("Nyquist limit", f"{sample_rate / 2:,.0f} Hz")
+    k3.metric("Samples", f"{len(y):,}")
+    k4.metric("Duration", f"{len(y) / sample_rate:.2f} s")
+tab_analysis, tab_filter, tab_spec, tab_ops, tab_voice = st.tabs(
+    ["Signal & Spectrum", "Filtering", "Spectrogram", "Operations", "Voice Demo"]
 )
 
 NO_SIGNAL_MSG = ("Upload a WAV file from the sidebar, or switch to 'Generate' "
@@ -97,12 +134,12 @@ with tab_analysis:
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Time-Domain Waveform")
-            st.plotly_chart(line_fig([("signal", t, y, BLUE)], "Time (s)", "Amplitude"),
+            show_chart(line_fig([("signal", t, y, BLUE)], "Time (s)", "Amplitude"),
                             width="stretch")
         with col2:
             st.subheader("Frequency Spectrum (FFT)")
             freqs, magnitude = compute_fft(y, sample_rate)
-            st.plotly_chart(line_fig([("signal", freqs, magnitude, NAVY)],
+            show_chart(line_fig([("signal", freqs, magnitude, NAVY)],
                                      "Frequency (Hz)", "Magnitude"),
                             width="stretch")
         st.metric("Dominant frequency detected",
@@ -112,6 +149,8 @@ with tab_analysis:
 with tab_filter:
     if y is None:
         st.info(NO_SIGNAL_MSG)
+    elif sample_rate < 200:
+        st.info("The filter controls need a sample rate of at least 200 Hz. Raise it in the sidebar.")
     else:
         nyq = int(sample_rate / 2)
         c1, c2, c3 = st.columns(3)
@@ -148,7 +187,7 @@ with tab_filter:
             a, b = st.columns(2)
             with a:
                 st.subheader("Time domain: before vs after")
-                st.plotly_chart(line_fig([("original", t, y, BLUE),
+                show_chart(line_fig([("original", t, y, BLUE),
                                           ("filtered", t, y_f, ORANGE)],
                                          "Time (s)", "Amplitude"),
                                 width="stretch")
@@ -156,12 +195,12 @@ with tab_filter:
                 st.subheader("Spectrum: before vs after")
                 f0, m0 = compute_fft(y, sample_rate)
                 f1, m1 = compute_fft(y_f, sample_rate)
-                st.plotly_chart(line_fig([("original", f0, m0, BLUE),
+                show_chart(line_fig([("original", f0, m0, BLUE),
                                           ("filtered", f1, m1, ORANGE)],
                                          "Frequency (Hz)", "Magnitude"),
                                 width="stretch")
             st.subheader("Filter frequency response")
-            st.plotly_chart(line_fig([("response", fr, mag_db, NAVY)],
+            show_chart(line_fig([("response", fr, mag_db, NAVY)],
                                      "Frequency (Hz)", "Gain (dB)", height=280),
                             width="stretch")
             m1_, m2_ = st.columns(2)
@@ -197,12 +236,173 @@ with tab_spec:
         except ValueError as e:
             st.error(str(e))
         else:
-            fmax = st.slider("Max frequency shown (Hz)", 100, int(fs_s / 2), int(fs_s / 2))
-            st.plotly_chart(spec_fig(f_sp, t_sp, s_db, fmax=fmax), width="stretch")
+            fmax = st.slider("Max frequency shown (Hz)", max(1, min(100, int(fs_s / 2) - 1)), int(fs_s / 2), int(fs_s / 2))
+            show_chart(spec_fig(f_sp, t_sp, s_db, fmax=fmax), width="stretch")
             st.caption(f"Frequency resolution: about {fs_s / min(win_len, len(x_s)):.1f} Hz per bin; "
                        f"time step: {1000 * (min(win_len, len(x_s)) * (1 - overlap)) / fs_s:.1f} ms.")
 
-# ===== Tab 4: voice demo =====
+# ===== Tab 4: convolution / correlation / modulation / windowing =====
+with tab_ops:
+    if y is None:
+        st.info(NO_SIGNAL_MSG)
+    elif sample_rate < 800:
+        st.info("These tools need a sample rate of at least 800 Hz. Raise it in the sidebar.")
+    else:
+        fs_o = float(sample_rate)
+        nyq_o = fs_o / 2
+        x_o = y[: int(5 * fs_o)]
+        if len(y) > len(x_o):
+            st.caption("Using the first 5 seconds of the signal for these tools.")
+        op = st.radio("Operation", ["Convolution", "Correlation", "Modulation", "Windowing"],
+                      horizontal=True)
+
+        # ---- convolution ----
+        if op == "Convolution":
+            kernel_name = st.selectbox("Kernel", ["Moving average", "Echo", "Differentiator"])
+            if kernel_name == "Moving average":
+                n_k = st.slider("Averaging length (samples)", 2, 200, 10)
+                h = moving_average_kernel(n_k)
+            elif kernel_name == "Echo":
+                e1, e2 = st.columns(2)
+                d_ms = e1.slider("Echo delay (ms)", 5, 500, 100)
+                gain = e2.slider("Echo gain", 0.1, 1.0, 0.5)
+                h = echo_kernel(fs_o, d_ms / 1000, gain)
+            else:
+                h = np.array([1.0, -1.0])
+            y_c = convolve_signals(x_o, h, mode="same")
+            a, b = st.columns(2)
+            with a:
+                st.subheader("Kernel h[n]")
+                kx, ky = thin(np.arange(len(h)), h)
+                show_chart(line_fig([("h[n]", kx, ky, NAVY)], "Sample n", "Weight"),
+                                width="stretch")
+            with b:
+                st.subheader("Signal: before vs after")
+                tx, ox, cx = thin(t[: len(x_o)], x_o, y_c)
+                show_chart(line_fig([("original", tx, ox, BLUE), ("convolved", tx, cx, ORANGE)],
+                                         "Time (s)", "Amplitude"), width="stretch")
+            f0, m0 = compute_fft(x_o, fs_o)
+            f1, m1 = compute_fft(y_c, fs_o)
+            st.subheader("Spectrum: before vs after")
+            show_chart(line_fig([("original", f0, m0, BLUE), ("convolved", f1, m1, ORANGE)],
+                                     "Frequency (Hz)", "Magnitude", height=300), width="stretch")
+            st.caption("Convolution in time multiplies the spectrum by the kernel's frequency "
+                       "response: a moving average is a low-pass filter, an echo adds ripples, "
+                       "and a differentiator boosts high frequencies.")
+
+        # ---- correlation ----
+        elif op == "Correlation":
+            ctype = st.radio("Correlation type",
+                             ["Cross-correlation (find a delay)", "Autocorrelation"],
+                             horizontal=True)
+            if ctype.startswith("Cross"):
+                p1, p2, p3 = st.columns(3)
+                probe = p1.radio("Probe signal", ["Random noise", "Current signal"])
+                max_ms = max(2, min(500, int(1000 * len(x_o) / fs_o / 2)))
+                d_ms = p2.slider("True delay (ms)", 1, max_ms, min(25, max_ms))
+                noise_lvl = p3.slider("Noise added to delayed copy", 0.0, 2.0, 0.3)
+                rng = np.random.default_rng(0)
+                base = rng.standard_normal(len(x_o)) * np.std(x_o) if probe == "Random noise" else x_o
+                d = int(round(d_ms * fs_o / 1000))
+                delayed = np.concatenate([np.zeros(d), base])[: len(base)]
+                delayed = delayed + noise_lvl * np.std(base) * rng.standard_normal(len(base))
+                lags, c = cross_correlation(base, delayed, fs_o)
+                est_ms = 1000 * estimate_delay(base, delayed, fs_o)
+                m1_, m2_ = st.columns(2)
+                m1_.metric("True delay", f"{d * 1000 / fs_o:.1f} ms")
+                m2_.metric("Estimated delay", f"{est_ms:.1f} ms")
+                lx, cy = thin(lags * 1000, c)
+                show_chart(line_fig([("correlation", lx, cy, NAVY)], "Lag (ms)",
+                                         "Normalised correlation"), width="stretch")
+                if probe == "Current signal":
+                    st.caption("A periodic signal correlates with itself at every multiple of its "
+                               "period, so the delay is only known modulo the period. "
+                               "Switch to random noise for a single clear peak.")
+            else:
+                lags, c = cross_correlation(x_o, x_o, fs_o)
+                keep = lags >= 0
+                lx, cy = thin(lags[keep] * 1000, c[keep])
+                show_chart(line_fig([("autocorrelation", lx, cy, NAVY)], "Lag (ms)",
+                                         "Normalised correlation"), width="stretch")
+                per = estimate_period(x_o, fs_o)
+                m1_, m2_ = st.columns(2)
+                if per:
+                    m1_.metric("Period from autocorrelation", f"{per * 1000:.2f} ms")
+                    m2_.metric("Implied frequency", f"{1 / per:.1f} Hz")
+                else:
+                    m1_.info("No clear repeating pattern (non-periodic signal).")
+
+        # ---- modulation ----
+        elif op == "Modulation":
+            scheme = st.radio("Modulation scheme", ["AM", "FM"], horizontal=True)
+            msg = x_o / max(np.max(np.abs(x_o)), 1e-12)
+            c1, c2, c3 = st.columns(3)
+            fc = c1.slider("Carrier frequency (Hz)", 100, int(nyq_o) - 100,
+                           min(1000, int(nyq_o / 2)))
+            dev_max = int(min(fc, nyq_o - fc) * 0.9)
+            if scheme == "AM":
+                depth = c2.slider("Modulation depth", 0.1, 1.0, 0.8)
+            elif dev_max < 20:
+                st.error("The carrier is too close to 0 Hz or Nyquist for FM. "
+                         "Move it toward the middle.")
+            else:
+                dev = c2.slider("Frequency deviation (Hz)", 10, dev_max, min(200, dev_max))
+            noise_lvl = c3.slider("Channel noise", 0.0, 1.0, 0.1)
+            bw = st.slider("Receiver low-pass (Hz)", 20, int(nyq_o * 0.9), min(500, int(nyq_o * 0.4)))
+            if scheme == "AM" or dev_max >= 20:
+                if scheme == "AM":
+                    s = am_modulate(msg, fs_o, fc, depth)
+                else:
+                    s = fm_modulate(msg, fs_o, fc, dev)
+                rx = s + noise_lvl * np.std(s) * np.random.default_rng(0).standard_normal(len(s))
+                m_hat = (am_demodulate(rx, fs_o, depth, bw) if scheme == "AM"
+                         else fm_demodulate(rx, fs_o, fc, dev, bw))
+                win_s = st.slider("Time window shown (s)", 0.01,
+                                  float(max(0.05, len(x_o) / fs_o)),
+                                  float(min(0.1, max(0.05, len(x_o) / fs_o))))
+                k = int(win_s * fs_o)
+                a, b = st.columns(2)
+                with a:
+                    st.subheader(f"{scheme} signal received")
+                    show_chart(line_fig([("received", t[:k], rx[:k], ORANGE)],
+                                             "Time (s)", "Amplitude"), width="stretch")
+                with b:
+                    st.subheader("Spectrum of received signal")
+                    fr_, mr_ = compute_fft(rx, fs_o)
+                    show_chart(line_fig([("spectrum", fr_, mr_, NAVY)],
+                                             "Frequency (Hz)", "Magnitude"), width="stretch")
+                st.subheader("Message: original vs recovered")
+                show_chart(line_fig([("original", t[:k], msg[:k], BLUE),
+                                          ("recovered", t[:k], m_hat[:k], ORANGE)],
+                                         "Time (s)", "Normalised amplitude", height=300),
+                                width="stretch")
+                st.metric("Recovery error (RMS, % of message)",
+                          f"{100 * recovery_error(msg, m_hat):.1f} %")
+                if fc < 4 * dominant_frequency(x_o, fs_o):
+                    st.warning("The carrier should be well above the message frequency.")
+
+        # ---- windowing ----
+        else:
+            w1, w2 = st.columns(2)
+            f_tone = w1.slider("Test tone frequency (Hz)", 20.0, min(400.0, nyq_o - 50), 50.5, step=0.5)
+            names = w2.multiselect("Windows to compare", list(WINDOWS),
+                                   default=["Rectangular (none)", "Hanning"])
+            t_w = np.arange(int(fs_o)) / fs_o
+            tone_w = np.sin(2 * np.pi * f_tone * t_w)
+            fig_w = go.Figure()
+            for name in names:
+                fw, mw = windowed_spectrum(tone_w, fs_o, name)
+                fig_w.add_trace(go.Scatter(x=fw, y=to_db(mw), mode="lines", name=name))
+            fig_w.update_layout(xaxis_title="Frequency (Hz)", yaxis_title="Magnitude (dB)",
+                                xaxis_range=[0, min(500, nyq_o)], height=380,
+                                margin=dict(l=40, r=20, t=20, b=40))
+            style_fig(fig_w)
+            show_chart(fig_w, width="stretch")
+            st.caption("A tone that doesn't land exactly on an FFT bin leaks energy into "
+                       "neighbouring bins. Windows taper the edges to reduce the leakage, "
+                       "at the cost of a wider main peak.")
+
+# ===== Tab 5: voice demo =====
 with tab_voice:
     st.subheader("Voice filtering demo")
     voice_file = st.file_uploader("Voice clip (WAV)", type=["wav"], key="voice_clip")
@@ -248,7 +448,7 @@ with tab_voice:
 
         fa, ma = compute_fft(x_in, fs)
         fb, mb = compute_fft(y_v, fs)
-        st.plotly_chart(line_fig([("before", fa, ma, BLUE), ("after", fb, mb, ORANGE)],
+        show_chart(line_fig([("before", fa, ma, BLUE), ("after", fb, mb, ORANGE)],
                                  "Frequency (Hz)", "Magnitude"),
                         width="stretch")
 
@@ -261,8 +461,10 @@ with tab_voice:
             s_b = np.maximum(s_b, ref - 80)
             g1, g2 = st.columns(2)
             g1.markdown("**Before**")
-            g1.plotly_chart(spec_fig(f_a, t_a, s_a), width="stretch")
+            with g1:
+                show_chart(spec_fig(f_a, t_a, s_a))
             g2.markdown("**After**")
-            g2.plotly_chart(spec_fig(f_b, t_b, s_b), width="stretch")
+            with g2:
+                show_chart(spec_fig(f_b, t_b, s_b))
         except ValueError as e:
             st.warning(f"Spectrogram unavailable: {e}")
